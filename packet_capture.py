@@ -29,6 +29,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
 import argparse
+from msh_sender import MessageSender
 
 # Import meshcore from PyPI
 import meshcore
@@ -203,12 +204,13 @@ load_env_files()
 class PacketCapture:
     """Standalone packet capture using meshcore package"""
     
-    def __init__(self, output_file: Optional[str] = None, verbose: bool = False, debug: bool = False, enable_mqtt: bool = True, shutdown_event=None):
+    def __init__(self, output_file: Optional[str] = None, verbose: bool = False, debug: bool = False, enable_mqtt: bool = True, shutdown_event=None, message_sender: MessageSender = None):
         self.output_file = output_file
         self.verbose = verbose
         self.debug = debug
         self.enable_mqtt = enable_mqtt
         self.shutdown_event = shutdown_event
+        self.message_sender = message_sender
         
         # Setup logging
         self.setup_logging()
@@ -3038,7 +3040,10 @@ class PacketCapture:
         if self.stats_status_enabled and self.stats_refresh_interval > 0:
             self.stats_update_task = asyncio.create_task(self.stats_refresh_scheduler())
         
-        
+        if self.message_sender:
+            self.message_sender.init_meshcore(self.meshcore)
+            self.send_messages_task = asyncio.create_task(self.message_sender.handle_sending_messsages())
+
         try:
             while not self.should_exit:
                 current_time = time.time()
@@ -3074,6 +3079,9 @@ class PacketCapture:
                 self.jwt_renewal_task.cancel()
             if self.stats_update_task:
                 self.stats_update_task.cancel()
+
+            if self.send_messages_task:
+                self.send_messages_task.cancel()
             
             # Cancel all tracked active tasks
             for task in self.active_tasks.copy():
@@ -3293,12 +3301,14 @@ async def main():
     signal.signal(signal.SIGINT, signal_handler)
     
     # Create packet capture instance with shutdown event
+    message_sender = MessageSender()
     capture = PacketCapture(
         output_file=args.output, 
         verbose=args.verbose,
         debug=args.debug,
         enable_mqtt=not args.no_mqtt,
-        shutdown_event=shutdown_event
+        shutdown_event=shutdown_event,
+        message_sender=message_sender
     )
     
     # Command line arguments override environment variable
