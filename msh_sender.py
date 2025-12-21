@@ -109,12 +109,15 @@ class MessageSender:
 
         self.logger.info(f"message to send: {msg_request}")
 
-        result = await self.mc.commands.send_chan_msg(msg_request.channel, msg_request.text)
+        if msg_request.channel and msg_request.text:
+            result = await self.mc.commands.send_chan_msg(msg_request.channel, msg_request.text)
 
-        if result.type == EventType.ERROR:
-            self.logger.error(f"Error sending message: {result.payload}")
+            if result.type == EventType.ERROR:
+                self.logger.error(f"Error sending message: {result.payload}")
+            else:
+                self.logger.info("Message sent")
         else:
-            self.logger.info("Message sent")
+            self.logger.warning("invalid text message")
 
         await asyncio.sleep(0.1)
 
