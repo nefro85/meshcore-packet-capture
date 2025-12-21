@@ -380,6 +380,10 @@ class PacketCapture:
         )
         
         self.logger = logging.getLogger('PacketCapture')
+
+        if self.message_sender:
+            #logging.getLogger('meshcore').setLevel(logging.DEBUG)
+            self.message_sender.init_logger(logging.getLogger('MessageSender'))
         
         # Test the logging format
         self.logger.info(f"Logging initialized with level: {log_level_str}")

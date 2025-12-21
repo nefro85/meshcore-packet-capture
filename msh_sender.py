@@ -83,7 +83,6 @@ class AsyncKafka:
 
 class MessageSender:
     def __init__(self):
-        self.logger = logging.Logger("MessageSender")
         self.running = True
         self.channel = 0xC8
         self.topic = "meshcore-text"
@@ -96,28 +95,34 @@ class MessageSender:
             group_id=self.group_id,
             enable_auto_commit=False,
         )
+    def init_logger(self, logger):
+        self.logger = logger
 
     def stop(self):
         self.running = False
 
     def init_meshcore(self, mc: MeshCore):
-        self.mc = mc
+        self.mc = mc 
 
     async def handle_kafka_message(self, msg):
         #print(msg.topic, msg.partition, msg.offset, msg.value)
         msg_request = json.loads(msg.value)
 
         self.logger.info(f"message to send: {msg_request}")
+        channel = msg_request['channel']
+        text = msg_request['text']
 
-        if msg_request.channel and msg_request.text:
-            result = await self.mc.commands.send_chan_msg(msg_request.channel, msg_request.text)
+        if channel and text:
+            result = await self.mc.commands.send_chan_msg(channel, text)
 
             if result.type == EventType.ERROR:
-                self.logger.error(f"Error sending message: {result.payload}")
+                self.logger.error(f"Error sending message: {result}")
             else:
                 self.logger.info("Message sent")
         else:
             self.logger.warning("invalid text message")
+
+        await self.kafka.commit()
 
         await asyncio.sleep(0.1)
 
@@ -137,6 +142,7 @@ class MessageSender:
                 break
             except Exception as e:
                 self.logger.error(f"Error: {e}")
+                logging.exception("oops")
                 break
 
         await self.kafka.stop()
