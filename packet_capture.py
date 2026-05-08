@@ -276,10 +276,12 @@ class PacketCapture:
         
         # Packet correlation cache
         self.rf_data_cache = {}
+        self.recent_rf_packets = {}
+        self.raw_duplicate_window = self.get_env_float('RAW_DUPLICATE_WINDOW', 2.0)
+        # When True (default), call get_msg() on MESSAGES_WAITING to drain the device message queue.
+        # Set PACKETCAPTURE_DRAIN_MESSAGES=false to capture RF packets only without pulling stored mesh messages.
+        self.drain_messages = self.get_env_bool('DRAIN_MESSAGES', True)
         self.packet_count = 0
-        
-        # Opted-in IDs for advert filtering (mirroring mctomqtt.py)
-        self.opted_in_ids = []
         
         # Device information
         self.device_name = None
@@ -297,9 +299,12 @@ class PacketCapture:
         self.jwt_renewal_threshold = self.get_env_int('JWT_RENEWAL_THRESHOLD', 300)  # Renew 5 minutes before expiry
         
         # Advert settings
-        self.advert_interval_hours = self.get_env_int('ADVERT_INTERVAL_HOURS', 11)
+        self.advert_interval_hours = self.get_env_int('ADVERT_INTERVAL_HOURS', 47)
         self.last_advert_time = 0
         self.advert_task = None
+        
+        # Load persisted advert state
+        self.last_advert_time = self._load_advert_state()
         
         # Packet type filtering for uploads
         upload_types_str = self.get_env('UPLOAD_PACKET_TYPES', '').strip()
@@ -411,6 +416,92 @@ class PacketCapture:
             return float(self.get_env(key, str(fallback)))
         except ValueError:
             return fallback
+    
+    def _get_state_file_path(self):
+        """Get the path to the state file for persisting last_advert_time.
+        
+        Works across all installation methods:
+        - Docker: Uses /app/data/ (mounted volume)
+        - NixOS: Uses cfg.dataDir (working directory)
+        - Systemd: Uses script directory or data subdirectory
+        """
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # Try data subdirectory first (works for Docker and if created)
+        data_dir = os.path.join(script_dir, 'data')
+        if os.path.exists(data_dir) and os.path.isdir(data_dir):
+            return os.path.join(data_dir, 'advert_state.json')
+        
+        # Fall back to script directory (works for all installation methods)
+        return os.path.join(script_dir, 'advert_state.json')
+    
+    def _load_advert_state(self):
+        """Load last_advert_time from persistent state file.
+        
+        Returns the timestamp if found, otherwise returns 0.
+        """
+        state_file = self._get_state_file_path()
+        
+        if not os.path.exists(state_file):
+            if self.debug:
+                self.logger.debug(f"Advert state file not found: {state_file}")
+            return 0
+        
+        try:
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+                last_time = state.get('last_advert_time', 0)
+                
+                # Validate the timestamp is reasonable (not in the future, not too old)
+                current_time = time.time()
+                if last_time > current_time:
+                    # Timestamp is in the future, ignore it
+                    if self.debug:
+                        self.logger.debug(f"Advert state timestamp is in the future, ignoring: {last_time}")
+                    return 0
+                
+                # If timestamp is more than 1 year old, treat as invalid
+                if current_time - last_time > 31536000:  # 1 year in seconds
+                    if self.debug:
+                        self.logger.debug(f"Advert state timestamp is too old, ignoring: {last_time}")
+                    return 0
+                
+                if self.debug:
+                    self.logger.debug(f"Loaded last_advert_time from state file: {last_time} ({datetime.fromtimestamp(last_time).isoformat()})")
+                return last_time
+                
+        except (json.JSONDecodeError, IOError, OSError) as e:
+            self.logger.warning(f"Failed to load advert state from {state_file}: {e}")
+            return 0
+    
+    def _save_advert_state(self):
+        """Save last_advert_time to persistent state file."""
+        state_file = self._get_state_file_path()
+        state_dir = os.path.dirname(state_file)
+        
+        try:
+            # Create directory if it doesn't exist (for data subdirectory case)
+            if state_dir and not os.path.exists(state_dir):
+                os.makedirs(state_dir, mode=0o755, exist_ok=True)
+            
+            state = {
+                'last_advert_time': self.last_advert_time,
+                'updated_at': time.time()
+            }
+            
+            # Write atomically using a temporary file
+            temp_file = state_file + '.tmp'
+            with open(temp_file, 'w') as f:
+                json.dump(state, f, indent=2)
+            
+            # Atomic rename
+            os.replace(temp_file, state_file)
+            
+            if self.debug:
+                self.logger.debug(f"Saved last_advert_time to state file: {self.last_advert_time} ({datetime.fromtimestamp(self.last_advert_time).isoformat()})")
+                
+        except (IOError, OSError) as e:
+            self.logger.warning(f"Failed to save advert state to {state_file}: {e}")
     
     
     def calculate_connection_retry_delay(self, attempt: int) -> float:
@@ -1249,6 +1340,15 @@ class PacketCapture:
             self.sdk_reconnect_exhausted = False
         self.reset_consecutive_failures("connection")
     
+    async def _start_auto_message_fetching_if_enabled(self):
+        """Start meshcore auto-fetch loop when PACKETCAPTURE_DRAIN_MESSAGES is enabled (default)."""
+        if not self.drain_messages:
+            self.logger.info(
+                "PACKETCAPTURE_DRAIN_MESSAGES is false: skipping auto message fetch (device message queue will not be drained)"
+            )
+            return
+        await self.meshcore.start_auto_message_fetching()
+    
     async def _setup_after_reconnection(self):
         """
         Perform all setup tasks required after a successful reconnection.
@@ -1260,7 +1360,7 @@ class PacketCapture:
         self.cleanup_event_subscriptions()
         # Re-setup event handlers after reconnection
         await self.setup_event_handlers()
-        await self.meshcore.start_auto_message_fetching()
+        await self._start_auto_message_fetching_if_enabled()
     
     def _check_ble_grace_period(self, failure_reason: str = "failed") -> bool:
         """
@@ -2140,8 +2240,8 @@ class PacketCapture:
 
     async def connect_mqtt(self):
         """Connect to all configured MQTT brokers"""
-        # Try to connect to MQTT1, MQTT2, MQTT3, MQTT4 (can expand if needed)
-        for broker_num in range(1, 5):
+        # Try to connect to MQTT1, MQTT2, MQTT3, MQTT4, MQTT5, MQTT6 (can expand if needed)
+        for broker_num in range(1, 7):
             client_info = await self.connect_mqtt_broker(broker_num)
             if client_info:
                 self.mqtt_clients.append(client_info)
@@ -2433,21 +2533,32 @@ class PacketCapture:
     def parse_advert(self, payload):
         """Parse advert payload - matches C++ AdvertDataHelpers.h implementation"""
         try:
-            # Validate minimum payload size
-            if len(payload) < 101:
-                self.logger.error(f"ADVERT payload too short: {len(payload)} bytes")
-                return {}
-            
+            # The advert header is fixed-width: pubkey (32) + timestamp (4) + signature (64).
+            if len(payload) < 100:
+                self.logger.error(f"ADVERT payload too short for header: {len(payload)} bytes")
+                return {
+                    "advert_parse_ok": False,
+                    "advert_error": "payload_too_short_header",
+                    "advert_payload_len": len(payload),
+                }
+
             # advert header
             pub_key = payload[0:32]
             timestamp = int.from_bytes(payload[32:32+4], "little")
             signature = payload[36:36+64]
 
+            advert = {
+                "advert_parse_ok": True,
+                "public_key": pub_key.hex(),
+                "advert_time": timestamp,
+                "signature": signature.hex(),
+            }
+
             # appdata - parse according to C++ AdvertDataParser
             app_data = payload[100:]
             if len(app_data) == 0:
                 self.logger.error("ADVERT has no app data")
-                return {}
+                return advert
             
             flags_byte = app_data[0]
             
@@ -2458,12 +2569,6 @@ class PacketCapture:
             # Create flags object with the full byte value
             flags = AdvertFlags(flags_byte)
             
-            advert = {
-                "public_key": pub_key.hex(),
-                "advert_time": timestamp,
-                "signature": signature.hex(),
-            }
-
             # Extract type from lower 4 bits (matches C++ getType())
             adv_type = flags_byte & 0x0F
             if adv_type == AdvertFlags.ADV_TYPE_CHAT:
@@ -2525,7 +2630,12 @@ class PacketCapture:
             
         except Exception as e:
             self.logger.error(f"Error parsing ADVERT payload: {e}", exc_info=True)
-            return {}
+            return {
+                "advert_parse_ok": False,
+                "advert_error": "exception",
+                "advert_error_detail": str(e),
+                "advert_payload_len": len(payload) if payload is not None else 0,
+            }
 
     def decode_and_publish_message(self, raw_data):
         """Decode message - matches Packet.cpp exactly"""
@@ -2552,20 +2662,33 @@ class PacketCapture:
                 self.logger.error(f"Packet too short for path_len at offset {offset}: {len(byte_data)} bytes")
                 return None
             
-            path_len = byte_data[offset]
+            path_len_byte = byte_data[offset]
             offset += 1
+
+            # MeshCore packs path_len byte: low 6 bits hop count, high 2 bits hash-size mode.
+            path_byte_len, path_hash_bytes = self._decode_packed_path_length(path_len_byte)
+            if self.debug:
+                self.logger.debug(
+                    "Decoded path length: "
+                    f"path_len_byte=0x{path_len_byte:02X}, path_byte_len={path_byte_len}, "
+                    f"path_hash_bytes={path_hash_bytes}, offset_after_path_len={offset}"
+                )
             
             # Check if we have enough data for the full path
-            if len(byte_data) < offset + path_len:
-                self.logger.error(f"Packet too short for path (need {offset + path_len}, have {len(byte_data)})")
+            if len(byte_data) < offset + path_byte_len:
+                self.logger.error(f"Packet too short for path (need {offset + path_byte_len}, have {len(byte_data)})")
                 return None
             
             # Extract path
-            path = byte_data[offset:offset + path_len].hex()
-            offset += path_len
+            path_bytes = byte_data[offset:offset + path_byte_len]
+            offset += path_byte_len
             
             # Remaining data is payload
             payload = byte_data[offset:]
+            if self.debug:
+                self.logger.debug(
+                    f"Packet layout: packet_len={len(byte_data)}, payload_offset={offset}, payload_len={len(payload)}"
+                )
             
             # Extract payload version (bits 6-7)
             payload_version = PayloadVersion((header >> 6) & 0x03)
@@ -2578,31 +2701,33 @@ class PacketCapture:
             # Extract payload type (bits 2-5)
             payload_type = PayloadType((header >> 2) & 0x0F)
 
-            # Convert path to list of hex values
-            path_values = []
-            i = 0
-            while i < len(path):
-                path_values.append(path[i:i+2])
-                i += 2
+            # Convert path bytes to hop tokens using decoded hash width (1/2/3 bytes)
+            path_values = self._split_path_hops(path_bytes, path_hash_bytes)
             
             message = {
                 "payload_type": payload_type.name,
                 "payload_type_value": payload_type.value,
                 "payload_version": payload_version.name,
                 "route_type": route_type.name,
-                "path": path_values
+                "path": path_values,
+                "path_len_byte": path_len_byte,
+                "path_byte_len": path_byte_len,
+                "path_hash_bytes": path_hash_bytes,
             }
         
             payload_value = {}
             if payload_type is PayloadType.ADVERT:
                 payload_value = self.parse_advert(payload)
+                if not payload_value.get("advert_parse_ok", False):
+                    self.logger.warning(
+                        "Dropping malformed ADVERT packet: "
+                        f"{payload_value.get('advert_error', 'unknown_error')} "
+                        f"(payload_len={payload_value.get('advert_payload_len', len(payload))})"
+                    )
+                    return None
             
             if payload_type is PayloadType.ADVERT:
-                key_prefix = payload_value["public_key"][:2]
-                if payload_value["name"].endswith("^"):
-                    message.update(payload_value)
-                elif key_prefix not in self.opted_in_ids:
-                    self.opted_in_ids.append(key_prefix)
+                message.update(payload_value)
             else:
                 message.update(payload_value)
                 
@@ -2615,6 +2740,58 @@ class PacketCapture:
             self.logger.error(f"Error decoding packet (len={len(byte_data)}): {e}", exc_info=True)
             self.logger.error(f"Failed packet hex: {raw_data}")
             return None
+
+    def _decode_packed_path_length(self, path_len_byte: int, max_path_size: int = 64) -> tuple[int, int]:
+        """Decode packed path length byte per MeshCore firmware.
+
+        path_len layout:
+        - low 6 bits: hop count
+        - high 2 bits: bytes-per-hop minus 1
+        """
+        hop_count = path_len_byte & 0x3F
+        bytes_per_hop = (path_len_byte >> 6) + 1
+
+        # Mode 3 => 4 bytes/hop is reserved in firmware; fallback to legacy interpretation.
+        if bytes_per_hop == 4:
+            if self.debug:
+                self.logger.debug(
+                    "Path decode fallback to legacy length due to reserved hash-size mode: "
+                    f"path_len_byte=0x{path_len_byte:02X}"
+                )
+            return path_len_byte, 1
+
+        path_byte_len = hop_count * bytes_per_hop
+        if path_byte_len > max_path_size:
+            # Invalid packed value; fallback keeps compatibility with legacy one-byte parsing.
+            if self.debug:
+                self.logger.debug(
+                    "Path decode fallback to legacy length due to oversized packed path: "
+                    f"path_len_byte=0x{path_len_byte:02X}, hop_count={hop_count}, "
+                    f"bytes_per_hop={bytes_per_hop}, computed_path_byte_len={path_byte_len}, "
+                    f"max_path_size={max_path_size}"
+                )
+            return path_len_byte, 1
+
+        if self.debug:
+            self.logger.debug(
+                "Path decode packed mode: "
+                f"path_len_byte=0x{path_len_byte:02X}, hop_count={hop_count}, "
+                f"bytes_per_hop={bytes_per_hop}, path_byte_len={path_byte_len}"
+            )
+        return path_byte_len, bytes_per_hop
+
+    def _split_path_hops(self, path_bytes: bytes, bytes_per_hop: int) -> list[str]:
+        """Split path bytes into per-hop hex tokens."""
+        path_hex = path_bytes.hex()
+        hop_hex_chars = max(bytes_per_hop, 1) * 2
+
+        if hop_hex_chars <= 0:
+            hop_hex_chars = 2
+
+        nodes = [path_hex[i:i + hop_hex_chars] for i in range(0, len(path_hex), hop_hex_chars)]
+        if (len(path_hex) % hop_hex_chars) != 0:
+            nodes = [path_hex[i:i + 2] for i in range(0, len(path_hex), 2)]
+        return nodes
     
     def calculate_packet_hash(self, raw_hex: str, payload_type: int = None) -> str:
         """Calculate hash for packet identification - based on packet.cpp"""
@@ -2635,13 +2812,23 @@ class PacketCapture:
             offset = 1  # After header
             if has_transport:
                 offset += 4  # Skip 4 bytes of transport codes
+
+            if len(byte_data) <= offset:
+                self.logger.debug(f"Packet too short for path_len while hashing: len={len(byte_data)}, offset={offset}")
+                return "0000000000000000"
             
-            # Read path_len (1 byte on wire, but stored as uint16_t in C++)
-            path_len = byte_data[offset]
+            # Read packed path_len byte from wire
+            path_len_byte = byte_data[offset]
             offset += 1
-            
+
             # Skip past the path to get to payload
-            payload_start = offset + path_len
+            path_byte_len, _ = self._decode_packed_path_length(path_len_byte)
+            payload_start = offset + path_byte_len
+            if payload_start > len(byte_data):
+                self.logger.debug(
+                    f"Packet too short for decoded path while hashing: need {payload_start}, have {len(byte_data)}"
+                )
+                return "0000000000000000"
             payload_data = byte_data[payload_start:]
             
             # Calculate hash exactly like MeshCore Packet::calculatePacketHash():
@@ -2654,8 +2841,8 @@ class PacketCapture:
             if payload_type == 9:  # PAYLOAD_TYPE_TRACE
                 # C++ does: sha.update(&path_len, sizeof(path_len))
                 # path_len is uint16_t, so sizeof(path_len) = 2 bytes
-                # Convert path_len to 2-byte little-endian uint16_t
-                hash_obj.update(path_len.to_bytes(2, byteorder='little'))
+                # Convert wire path_len byte to 2-byte little-endian uint16_t
+                hash_obj.update(path_len_byte.to_bytes(2, byteorder='little'))
             
             hash_obj.update(payload_data)
             
@@ -2709,7 +2896,7 @@ class PacketCapture:
                 "PATH": "8",
                 "TRACE": "9",
                 "MULTIPART": "10",
-                "Type11": "11",
+                "CONTROL": "11",
                 "Type12": "12",
                 "Type13": "13",
                 "Type14": "14",
@@ -2725,7 +2912,9 @@ class PacketCapture:
                 if decoded_message and 'path' in decoded_message:
                     # Calculate actual payload length from the raw data
                     # Total bytes - header(1) - transport(4 if present) - path_length(1) - path_bytes
-                    path_len_bytes = len(decoded_message['path']) // 2  # Convert hex chars to bytes
+                    path_len_bytes = decoded_message.get('path_byte_len')
+                    if path_len_bytes is None:
+                        path_len_bytes = len(decoded_message.get('path', []))
                     has_transport = decoded_message.get('route_type') in ['TRANSPORT_FLOOD', 'TRANSPORT_DIRECT']
                     transport_bytes = 4 if has_transport else 0
                     payload_len = str(max(0, packet_len - 1 - transport_bytes - 1 - path_len_bytes))
@@ -2820,6 +3009,13 @@ class PacketCapture:
                         if current_time - v['timestamp'] < timeout
                     }
                     
+                    # Remember RF-originated packets so RAW_DATA for the same reception doesn't double-publish.
+                    self.recent_rf_packets[raw_hex.upper()] = current_time
+                    self.recent_rf_packets = {
+                        k: v for k, v in self.recent_rf_packets.items()
+                        if current_time - v < self.raw_duplicate_window
+                    }
+
                     # Process the packet
                     await self.process_packet_from_rf_data(raw_hex, rf_data)
                 else:
@@ -2869,6 +3065,19 @@ class PacketCapture:
                 # Remove 0x prefix if present
                 if raw_hex.startswith('0x'):
                     raw_hex = raw_hex[2:]
+
+                raw_hex = raw_hex.upper()
+                current_time = time.time()
+                recent_rf_time = self.recent_rf_packets.get(raw_hex)
+                if recent_rf_time is not None and (current_time - recent_rf_time) < self.raw_duplicate_window:
+                    if self.debug:
+                        self.logger.debug("Skipping RAW_DATA packet already processed from RX_LOG_DATA")
+                    return
+
+                self.recent_rf_packets = {
+                    k: v for k, v in self.recent_rf_packets.items()
+                    if current_time - v < self.raw_duplicate_window
+                }
                 
                 # Find corresponding RF data
                 packet_prefix = raw_hex[:32]
@@ -3022,8 +3231,8 @@ class PacketCapture:
         # Setup event handlers
         await self.setup_event_handlers()
         
-        # Start auto message fetching
-        await self.meshcore.start_auto_message_fetching()
+        # Start auto message fetching (optional; see PACKETCAPTURE_DRAIN_MESSAGES)
+        await self._start_auto_message_fetching_if_enabled()
         
         self.logger.info("Packet capture is running. Press Ctrl+C to stop.")
         self.logger.info("Waiting for packets...")
@@ -3201,6 +3410,7 @@ class PacketCapture:
             self.logger.info("Sending flood advert...")
             await self.meshcore.commands.send_advert(flood=True)
             self.last_advert_time = time.time()
+            self._save_advert_state()  # Persist the timestamp
             self.logger.info("Flood advert sent successfully!")
             return True
             

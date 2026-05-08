@@ -2,6 +2,7 @@
 config.ini
 .env.*
 old/
+advert_state.json
 
 # Python
 __pycache__/
@@ -75,3 +76,4 @@ Thumbs.db
 # Testing directory (not committed to repo)
 tests/
 nixos-test/
+local-docs/

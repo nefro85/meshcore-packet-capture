@@ -112,6 +112,7 @@ Configuration is handled via environment variables and `.env` files. The install
 - `PACKETCAPTURE_MAX_CONNECTION_RETRIES`: Maximum MeshCore connection retry attempts (0 = infinite)
 - `PACKETCAPTURE_CONNECTION_RETRY_DELAY`: Delay between MeshCore reconnection attempts (seconds)
 - `PACKETCAPTURE_HEALTH_CHECK_INTERVAL`: How often to check connection health (seconds)
+- `PACKETCAPTURE_DRAIN_MESSAGES`: When `true` (default), run meshcore auto message fetch so the device message queue is drained; set to `false` for RF packet capture only without pulling stored messages
 
 #### Logging Settings
 - `PACKETCAPTURE_LOG_LEVEL`: Log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) - default: `INFO`
@@ -124,7 +125,7 @@ Configuration is handled via environment variables and `.env` files. The install
 When enabled, status messages published to MQTT include a `stats` object with battery, uptime, queue depth, and radio runtime metrics refreshed at the configured cadence.
 
 #### MQTT Settings
-The script supports up to 4 MQTT brokers (MQTT1, MQTT2, MQTT3, MQTT4). Each broker can be configured independently:
+The script supports up to 4 MQTT brokers (MQTT1, MQTT2, MQTT3, MQTT4, MQTT5, MQTT6). Each broker can be configured independently:
 
 **Broker 1 (Primary):**
 - `PACKETCAPTURE_MQTT1_ENABLED`: Enable/disable MQTT broker 1
@@ -141,7 +142,7 @@ The script supports up to 4 MQTT brokers (MQTT1, MQTT2, MQTT3, MQTT4). Each brok
 - `PACKETCAPTURE_MQTT1_RETAIN`: Retain messages
 - `PACKETCAPTURE_MQTT1_KEEPALIVE`: Keep-alive interval
 
-**Brokers 2-4:** Same pattern with `MQTT2_`, `MQTT3_`, `MQTT4_` prefixes
+**Brokers 2-6:** Same pattern with `MQTT2_`, `MQTT3_`, `MQTT4_`, `MQTT5_`, `MQTT6_` prefixes
 
 **Global MQTT Settings:**
 - `PACKETCAPTURE_MAX_MQTT_RETRIES`: Maximum MQTT connection retry attempts (0 = infinite)
@@ -227,7 +228,8 @@ This setting allows you to filter which packet types are uploaded to MQTT broker
 - `8` = PATH
 - `9` = TRACE
 - `10` = MULTIPART
-- `11-14` = Reserved
+- `11` = CONTROL
+- `12-14` = Reserved
 - `15` = RAW_CUSTOM
 
 **Examples:**
